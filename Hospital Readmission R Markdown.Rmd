@@ -1,0 +1,645 @@
+---
+title: "EDA"
+output: html_document
+date: "2025-12-04"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(tidyverse)
+library(forcats)
+library(GGally)
+library(car)
+library(glmnet)
+library(randomForest)
+library(xgboost)
+library(pROC)
+library(mgcv)
+library(e1071)
+library(xgboost)
+library(ggplot2)
+
+
+#setwd("~/Downloads/AppliedStats")
+df <- read.csv("hospital_readmissions.csv")
+head(df)
+# check missing values
+colSums(is.na(df))
+lapply(df, function(x) unique(x))
+
+# Convert age to ordered factor
+df <- df %>%
+  mutate(age = factor(age,
+                      levels = c("[0-10)","[10-20)","[20-30)","[30-40)",
+                                 "[40-50)","[50-60)","[60-70)","[70-80)",
+                                 "[80-90)","[90-100)"),
+                      ordered = TRUE))
+
+# Convert yes/no variables to binary
+df <- df %>%
+  mutate(
+    change = ifelse(change == "yes", 1, 0),
+    diabetes_med = ifelse(diabetes_med == "yes", 1, 0),
+    readmitted = ifelse(readmitted == "yes", 1, 0)
+  )
+
+# Check if there are any duplicate rows
+sum(duplicated(df))
+
+
+
+# Diagnosis cleaning
+df <- df %>%
+  mutate(
+    across(starts_with("diag_"), 
+           ~ifelse(.x %in% c("Missing", "Other"), "Other", .x)),
+    diag_1 = as.factor(diag_1),
+    diag_2 = as.factor(diag_2),
+    diag_3 = as.factor(diag_3)
+  )
+
+# Order diagnosis categories by frequency
+df <- df %>%
+  mutate(
+    diag_1 = fct_infreq(diag_1),
+    diag_2 = fct_infreq(diag_2),
+    diag_3 = fct_infreq(diag_3)
+  )
+par(mfrow = c(3,1))
+for (d in c("diag_1","diag_2","diag_3")) {
+  tab <- table(df[[d]], df$readmitted)
+  barplot(t(tab),
+          main = paste("Readmission Breakdown by", d),
+          col = c("lightgray", "red"),
+          las = 2,
+          cex.names = 0.7)
+  legend("topright", legend = c("No","Yes"), fill=c("lightgray","red"))
+}
+
+# Medical specialty cleaning
+df <- df %>%
+  mutate(medical_specialty = ifelse(medical_specialty %in% c("Other","Missing"),
+                                    "Other", medical_specialty),
+         medical_specialty = as.factor(medical_specialty))
+
+# Numeric distributions
+numeric_cols <- df %>%
+  select(time_in_hospital, n_procedures, n_lab_procedures,
+         n_medications, n_outpatient, n_inpatient, n_emergency)
+par(mfrow = c(3,3))
+for (col in names(numeric_cols)) {
+  hist(numeric_cols[[col]], main = paste("Distribution of", col),
+       xlab = col, col = "lightblue")
+}
+
+# Correlation matrix
+par(mfrow = c(1,1))
+ggcorr(numeric_cols, label = TRUE)
+
+# Readmission rate
+readmit_freq <- table(df$readmitted)
+prop.table(table(df$readmitted))
+barplot(readmit_freq, main="Overall Readmission", 
+        col=c("gray", "red"), names.arg=c("No","Yes"))
+
+# Outliers
+par(mfrow = c(2,4))
+for (col in names(numeric_cols)) {
+  boxplot(numeric_cols[[col]], main = col, col = "lightgreen")
+}
+head(df)
+# Feature Engineering
+
+# Total visits
+df$total_visits <- df$n_outpatient + df$n_inpatient + df$n_emergency
+df$frequent_visitor <- ifelse(df$total_visits >= 5, 1, 0)
+
+# Emergency Exposure
+df$had_emergency <- ifelse(df$n_emergency > 0, 1, 0)
+df$emergency_ratio <- df$n_emergency / (df$total_visits + 1)
+
+
+# Lots of medical attention
+df$meds_per_day <- df$n_medications / df$time_in_hospital
+df$procedures_per_day <- df$n_procedures / df$time_in_hospital
+df$lab_procedures_per_day <- df$n_lab_procedures / df$time_in_hospital
+df$high_intensity <- ifelse(df$meds_per_day > median(df$meds_per_day), 1, 0)
+df$long_stay <- ifelse(df$time_in_hospital >= 7, 1, 0)
+df$both_tests_done <- ifelse(
+  df$glucose_test != "None" & df$A1Ctest != "None", 1, 0
+)
+df$excessive_polypharmacy <- ifelse(df$n_medications >= 10, 1, 0)
+df$polypharmacy <- ifelse(df$n_medications >= 5, 1, 0)
+
+
+#Logarithmic Versions
+df$log_meds <- log(df$n_medications + 1)
+df$log_visits <- log(df$total_visits + 1)
+df$log_procedures <-log(df$n_procedures + 1)
+df$log_inpatient <-log(df$n_inpatient + 1)
+
+# Age Features
+df$age_num <- as.numeric(df$age) * 10 + 5 
+df$elderly <- ifelse(df$age_num >= 65, 1, 0)
+df$elderly_high_intensity <- df$elderly * df$high_intensity
+df$elderly_long_stay <- df$elderly * df$long_stay
+
+
+
+df$any_lab_test <- ifelse(df$glucose_test != "None" | df$A1Ctest != "None", 1, 0)
+df$diag_diversity <- length(unique(c(df$diag_1, df$diag_2, df$diag_3)))
+
+# Curated Feature pool
+features <- c(  
+  "had_emergency",
+  "procedures_per_day",
+  "age_num",
+  "polypharmacy",
+  "long_stay",
+  "log_meds",
+  "log_visits"
+)
+
+#Statistical Tests for features (logistic regression)
+pvals <- sapply(features, function(v) {
+  fit <- glm(
+    readmitted ~ .,
+    data = df[, c("readmitted", v)],
+    family = binomial
+  )
+  summary(fit)$coefficients[2, 4]
+})
+#FDF correction (Benjamini-Hochberg)
+pvals_adj <- p.adjust(pvals, method = "BH")
+
+fdr_results <- data.frame(
+  feature = features,
+  p_value = pvals,
+  p_adj = pvals_adj
+)
+
+fdr_results
+
+# Features with p-value less than 0.01
+selected_features <- subset(fdr_results, p_adj < 0.01)
+selected_features
+selected_feature_names <- selected_features$feature
+model_vars <- df[, selected_feature_names]
+
+# Co-linearity matrix
+ggcorr(model_vars, label = TRUE, diag = FALSE)
+
+
+model <- glm(
+  readmitted ~ total_visits + had_emergency + meds_per_day +
+               procedures_per_day + polypharmacy + elderly + long_stay,
+  data = df,
+  family = binomial
+)
+
+# VIF Test (Variance Inflation Factor)
+vif(model)
+
+```
+# -----------------------------
+# Modeling add-on using CLEANED df (do not rename, do not delete earlier code)
+# -----------------------------
+```{r}
+set.seed(123)
+
+df$readmitted <- as.integer(df$readmitted)
+
+n <- as.integer(nrow(df))
+idx_train <- sample.int(n, size = floor(0.60 * n))
+rem <- setdiff(seq_len(n), idx_train)
+idx_valid <- sample(rem, size = floor(0.50 * length(rem)))
+idx_test  <- setdiff(rem, idx_valid)
+
+train_df <- df[idx_train, ]
+valid_df <- df[idx_valid, ]
+test_df  <- df[idx_test,  ]
+
+eval_probs <- function(y_true, p_hat, thr = 0.5) {
+  y_hat <- ifelse(p_hat >= thr, 1, 0)
+  acc <- mean(y_hat == y_true)
+  sens <- ifelse(sum(y_true == 1) == 0, NA, sum(y_hat == 1 & y_true == 1) / sum(y_true == 1))
+  spec <- ifelse(sum(y_true == 0) == 0, NA, sum(y_hat == 0 & y_true == 0) / sum(y_true == 0))
+  auc <- as.numeric(pROC::auc(pROC::roc(y_true, p_hat, quiet = TRUE)))
+  c(Accuracy = acc, Sensitivity = sens, Specificity = spec, AUC = auc)
+}
+
+form <- readmitted ~ total_visits + had_emergency + meds_per_day + procedures_per_day +
+  polypharmacy + elderly + long_stay
+```
+# 1) Logistic regression
+```{r}
+m_glm <- glm(form, data = train_df, family = binomial)
+p_valid_glm <- predict(m_glm, newdata = valid_df, type = "response")
+p_test_glm  <- predict(m_glm, newdata = test_df,  type = "response")
+
+glm_valid_metrics <- eval_probs(valid_df$readmitted, p_valid_glm)
+glm_test_metrics  <- eval_probs(test_df$readmitted,  p_test_glm)
+
+glm_valid_metrics
+glm_test_metrics
+```
+
+# 2) Penalized logistic (LASSO / Ridge)
+```{r}
+x_train <- model.matrix(form, data = train_df)[, -1]
+x_valid <- model.matrix(form, data = valid_df)[, -1]
+x_test  <- model.matrix(form, data = test_df)[, -1]
+
+y_train <- train_df$readmitted
+y_valid <- valid_df$readmitted
+y_test  <- test_df$readmitted
+
+set.seed(123)
+cv_lasso <- cv.glmnet(x_train, y_train, family = "binomial", alpha = 1, nfolds = 5)
+p_valid_lasso <- as.numeric(predict(cv_lasso, newx = x_valid, s = "lambda.min", type = "response"))
+p_test_lasso  <- as.numeric(predict(cv_lasso, newx = x_test,  s = "lambda.min", type = "response"))
+
+lasso_valid_metrics <- eval_probs(y_valid, p_valid_lasso)
+lasso_test_metrics  <- eval_probs(y_test,  p_test_lasso)
+
+lasso_valid_metrics
+lasso_test_metrics
+
+set.seed(123)
+cv_ridge <- cv.glmnet(x_train, y_train, family = "binomial", alpha = 0, nfolds = 5)
+p_valid_ridge <- as.numeric(predict(cv_ridge, newx = x_valid, s = "lambda.min", type = "response"))
+p_test_ridge  <- as.numeric(predict(cv_ridge, newx = x_test,  s = "lambda.min", type = "response"))
+
+ridge_valid_metrics <- eval_probs(y_valid, p_valid_ridge)
+ridge_test_metrics  <- eval_probs(y_test,  p_test_ridge)
+
+ridge_valid_metrics
+ridge_test_metrics
+```
+
+# 3) Random Forest 
+```{r}
+train_df$readmitted_f <- factor(ifelse(train_df$readmitted == 1, "Yes", "No"))
+valid_df$readmitted_f <- factor(ifelse(valid_df$readmitted == 1, "Yes", "No"))
+test_df$readmitted_f  <- factor(ifelse(test_df$readmitted == 1,  "Yes", "No"))
+
+set.seed(123)
+m_rf <- randomForest(
+readmitted_f ~ total_visits + had_emergency + meds_per_day + procedures_per_day +
+polypharmacy + elderly + long_stay,
+data = train_df,
+ntree = 500,
+mtry = 3,
+importance = TRUE
+)
+
+p_valid_rf <- predict(m_rf, newdata = valid_df, type = "prob")[, "Yes"]
+p_test_rf  <- predict(m_rf, newdata = test_df,  type = "prob")[, "Yes"]
+
+rf_valid_metrics <- eval_probs(valid_df$readmitted, p_valid_rf)
+rf_test_metrics  <- eval_probs(test_df$readmitted,  p_test_rf)
+
+rf_valid_metrics
+rf_test_metrics
+
+importance(m_rf)
+varImpPlot(m_rf)
+```
+
+# 4) XGBoost
+```{r}
+dtrain <- xgb.DMatrix(data = x_train, label = y_train)
+dvalid <- xgb.DMatrix(data = x_valid, label = y_valid)
+dtest  <- xgb.DMatrix(data = x_test,  label = y_test)
+
+params <- list(
+objective = "binary:logistic",
+eval_metric = "auc",
+eta = 0.05,
+max_depth = 4,
+subsample = 0.8,
+colsample_bytree = 0.8,
+min_child_weight = 1
+)
+
+set.seed(123)
+m_xgb <- xgb.train(
+params = params,
+data = dtrain,
+nrounds = 2000,
+watchlist = list(train = dtrain, valid = dvalid),
+early_stopping_rounds = 50,
+verbose = 0
+)
+
+p_valid_xgb <- predict(m_xgb, dvalid)
+p_test_xgb  <- predict(m_xgb, dtest)
+
+xgb_valid_metrics <- eval_probs(y_valid, p_valid_xgb)
+xgb_test_metrics  <- eval_probs(y_test,  p_test_xgb)
+
+xgb_valid_metrics
+xgb_test_metrics
+
+xgb_imp <- xgb.importance(model = m_xgb)
+xgb_imp
+xgb.plot.importance(xgb_imp, top_n = 15)
+```
+
+# 5) GAM (Generalized Additive Model)
+```{r}
+m_gam <- mgcv::gam(
+readmitted ~ s(total_visits) + had_emergency + s(meds_per_day) + s(procedures_per_day) +
+polypharmacy + elderly + long_stay,
+data = train_df,
+family = binomial,
+method = "REML"
+)
+
+p_valid_gam <- predict(m_gam, newdata = valid_df, type = "response")
+p_test_gam  <- predict(m_gam, newdata = test_df,  type = "response")
+
+gam_valid_metrics <- eval_probs(y_valid, p_valid_gam)
+gam_test_metrics  <- eval_probs(y_test,  p_test_gam)
+
+gam_valid_metrics
+gam_test_metrics
+
+summary(m_gam)
+plot(m_gam, pages = 1)
+```
+
+# 6) SVM (RBF kernel)
+```{r}
+svm_vars <- c("total_visits","had_emergency","meds_per_day","procedures_per_day","polypharmacy","elderly","long_stay")
+
+scale_from_train <- function(train_mat, new_mat) {
+mu <- colMeans(train_mat)
+s <- apply(train_mat, 2, sd)
+s[s == 0] <- 1
+new_scaled <- sweep(new_mat, 2, mu, "-")
+new_scaled <- sweep(new_scaled, 2, s, "/")
+list(train_mu = mu, train_sd = s, scaled = new_scaled)
+}
+
+Xtr <- as.matrix(train_df[, svm_vars])
+Xva <- as.matrix(valid_df[, svm_vars])
+Xte <- as.matrix(test_df[, svm_vars])
+
+sc_tr <- scale_from_train(Xtr, Xtr)
+mu <- sc_tr$train_mu
+sdv <- sc_tr$train_sd
+
+scale_apply <- function(mat, mu, sdv) {
+out <- sweep(mat, 2, mu, "-")
+sweep(out, 2, sdv, "/")
+}
+
+Xtr_s <- scale_apply(Xtr, mu, sdv)
+Xva_s <- scale_apply(Xva, mu, sdv)
+Xte_s <- scale_apply(Xte, mu, sdv)
+
+train_svm <- data.frame(readmitted_f = train_df$readmitted_f, Xtr_s)
+valid_svm <- data.frame(readmitted_f = valid_df$readmitted_f, Xva_s)
+test_svm  <- data.frame(readmitted_f = test_df$readmitted_f,  Xte_s)
+
+set.seed(123)
+m_svm <- e1071::svm(
+readmitted_f ~ .,
+data = train_svm,
+kernel = "radial",
+probability = TRUE
+)
+
+p_valid_svm <- attr(predict(m_svm, newdata = valid_svm, probability = TRUE), "probabilities")[, "Yes"]
+p_test_svm  <- attr(predict(m_svm, newdata = test_svm,  probability = TRUE), "probabilities")[, "Yes"]
+
+svm_valid_metrics <- eval_probs(y_valid, p_valid_svm)
+svm_test_metrics  <- eval_probs(y_test,  p_test_svm)
+
+svm_valid_metrics
+svm_test_metrics
+```
+# 7) XGBoost Tuned
+
+```{r}
+
+dtr <- xgb.DMatrix(x_train, label = y_train)
+dva <- xgb.DMatrix(x_valid, label = y_valid)
+dte <- xgb.DMatrix(x_test,  label = y_test)
+
+g <- expand.grid(
+  eta = c(0.01, 0.05, 0.1),
+  max_depth = c(3, 4, 6),
+  min_child_weight = c(1, 5),
+  subsample = c(0.7, 0.85, 1.0),
+  colsample_bytree = c(0.7, 0.85, 1.0)
+)
+
+best_auc <- -Inf
+best_par <- NULL
+best_nrounds <- NA_integer_
+best_model <- NULL
+
+for (i in seq_len(nrow(g))) {
+  p <- as.list(g[i, ])
+  p$objective <- "binary:logistic"
+  p$eval_metric <- "auc"
+  p$tree_method <- "hist"
+
+  m <- tryCatch(
+    xgb.train(
+      params = p,
+      data = dtr,
+      nrounds = 3000,
+      watchlist = list(train = dtr, valid = dva),
+      early_stopping_rounds = 50,
+      maximize = TRUE,
+      verbose = 0
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(m)) next
+
+  p_va <- predict(m, dva)
+  auc_va <- as.numeric(pROC::auc(pROC::roc(y_valid, p_va, quiet = TRUE)))
+
+  if (is.finite(auc_va) && auc_va > best_auc) {
+    best_auc <- auc_va
+    best_par <- p
+    best_nrounds <- m$best_iteration
+    best_model <- m
+  }
+}
+
+if (is.null(best_model)) {
+  best_par <- list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    eta = 0.05,
+    max_depth = 4,
+    subsample = 0.8,
+    colsample_bytree = 0.8,
+    min_child_weight = 1,
+    tree_method = "hist"
+  )
+
+  best_model <- xgb.train(
+    params = best_par,
+    data = dtr,
+    nrounds = 300,
+    watchlist = list(train = dtr, valid = dva),
+    early_stopping_rounds = 50,
+    maximize = TRUE,
+    verbose = 0
+  )
+  best_nrounds <- best_model$best_iteration
+}
+
+m_xgb_tuned <- best_model
+
+p_valid_xgb_tuned <- predict(m_xgb_tuned, dva)
+p_test_xgb_tuned  <- predict(m_xgb_tuned, dte)
+
+xgb_tuned_valid_metrics <- eval_probs(y_valid, p_valid_xgb_tuned)
+xgb_tuned_test_metrics  <- eval_probs(y_test,  p_test_xgb_tuned)
+
+best_par
+best_nrounds
+xgb_tuned_valid_metrics
+xgb_tuned_test_metrics
+
+```
+# Compare models
+```{r}
+results_valid <- rbind(
+  GLM       = glm_valid_metrics,
+  LASSO     = lasso_valid_metrics,
+  RIDGE     = ridge_valid_metrics,
+  RF        = rf_valid_metrics,
+  XGB       = xgb_valid_metrics,
+  XGB_TUNED = xgb_tuned_valid_metrics,
+  GAM       = gam_valid_metrics,
+  SVM       = svm_valid_metrics
+)
+
+results_test <- rbind(
+  GLM       = glm_test_metrics,
+  LASSO     = lasso_test_metrics,
+  RIDGE     = ridge_test_metrics,
+  RF        = rf_test_metrics,
+  XGB       = xgb_test_metrics,
+  XGB_TUNED = xgb_tuned_test_metrics,
+  GAM       = gam_test_metrics,
+  SVM       = svm_test_metrics
+)
+
+
+results_valid
+results_test
+```
+
+```{r}
+
+y_test <- test_df$readmitted
+
+preds_test <- list(
+  GLM       = p_test_glm,
+  LASSO     = p_test_lasso,
+  RIDGE     = p_test_ridge,
+  RF        = p_test_rf,
+  XGB       = p_test_xgb,
+  XGB_TUNED = p_test_xgb_tuned,
+  GAM       = p_test_gam,
+  SVM       = p_test_svm
+)
+
+```
+# 1) ROC curves (all models)
+```{r}
+roc_df <- do.call(rbind, lapply(names(preds_test), function(m) {
+r <- pROC::roc(y_test, preds_test[[m]], quiet = TRUE)
+data.frame(model = m, fpr = 1 - r$specificities, tpr = r$sensitivities)
+}))
+
+auc_df <- data.frame(
+model = names(preds_test),
+auc = sapply(names(preds_test), function(m) {
+as.numeric(pROC::auc(pROC::roc(y_test, preds_test[[m]], quiet = TRUE)))
+})
+)
+
+ggplot(roc_df, aes(x = fpr, y = tpr, color = model)) +
+geom_line(linewidth = 1) +
+geom_abline(linetype = 2) +
+labs(
+title = "ROC Curves (Test Set)",
+x = "False Positive Rate (1 - Specificity)",
+y = "True Positive Rate (Sensitivity)"
+) +
+theme_minimal()
+
+```
+# 2) AUC bar chart
+```{r}
+ggplot(auc_df, aes(x = reorder(model, auc), y = auc)) +
+geom_col() +
+coord_flip() +
+labs(title = "Test AUC by Model", x = "Model", y = "AUC") +
+theme_minimal()
+```
+#3) Confusion matrix heatmaps (thr = 0.5)
+```{r}
+cm_one <- function(y, p, thr = 0.5) {
+pred <- ifelse(p >= thr, 1, 0)
+as.data.frame(table(Predicted = pred, Actual = y))
+}
+
+cm_df <- do.call(rbind, lapply(names(preds_test), function(m) {
+d <- cm_one(y_test, preds_test[[m]], thr = 0.5)
+d$model <- m
+d
+}))
+
+ggplot(cm_df, aes(x = factor(Actual), y = factor(Predicted), fill = Freq)) +
+geom_tile() +
+geom_text(aes(label = Freq), color = "white", size = 4) +
+facet_wrap(~ model) +
+labs(
+title = "Confusion Matrices (Test Set, Threshold = 0.5)",
+x = "Actual",
+y = "Predicted"
+) +
+theme_minimal()
+```
+# 4) Calibration plot (binned)
+```{r}
+calibration_df <- do.call(rbind, lapply(names(preds_test), function(m) {
+p <- preds_test[[m]]
+bins <- cut(p, breaks = seq(0, 1, by = 0.1), include.lowest = TRUE)
+data.frame(
+model = m,
+mean_pred = as.numeric(tapply(p, bins, mean)),
+obs_rate  = as.numeric(tapply(y_test, bins, mean))
+)
+}))
+
+calibration_df <- calibration_df[complete.cases(calibration_df), ]
+
+ggplot(calibration_df, aes(x = mean_pred, y = obs_rate, color = model)) +
+geom_point() +
+geom_line() +
+geom_abline(linetype = 2) +
+labs(
+title = "Calibration Plot (Test Set)",
+x = "Mean Predicted Probability (per bin)",
+y = "Observed Readmission Rate (per bin)"
+) +
+theme_minimal()
+
+```
